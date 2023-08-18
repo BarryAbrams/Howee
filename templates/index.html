@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Data</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/3.0.3/socket.io.js"></script>
+    <style>
+        #container {
+            position: relative;
+            width: 255px; /* You can adjust the size as needed */
+            height: 255px;
+            border: 1px solid black;
+        }
+        .face-box {
+            position: absolute;
+            border: 2px solid red;
+            background-color: rgba(255, 0, 0, 0.2);
+        }
+    </style>
+</head>
+<body>
+    <h1>Face Data</h1>
+    <div id="container"></div>
+    <script>
+        var socket = io.connect('http://' + document.domain + ':' + location.port);
+        socket.on('face_data', function(data) {
+            var faces = data.faces;
+            var container = document.getElementById('container');
+            container.innerHTML = ''; // Clear previous faces
+            for (var i = 0; i < faces.length; i++) {
+
+                var face = faces[i];
+                var faceDiv = document.createElement('div');
+                faceDiv.className = 'face-box';
+                faceDiv.style.left = face.box_left + 'px';
+                faceDiv.style.top = face.box_top + 'px';
+                faceDiv.style.width = (face.box_left - face.box_right) + 'px';
+                faceDiv.style.height = (face.box_bottom - face.box_top) + 'px';
+                if (face.is_facing == 1) {
+                    faceDiv.style.borderColor = "green"
+                } else {
+                    faceDiv.style.borderColor = "red"
+
+                }
+                console.log(face.box_confidence)
+                container.appendChild(faceDiv);
+            }
+        });
+    </script>
+</body>
+</html>
