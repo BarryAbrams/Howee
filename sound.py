@@ -1,5 +1,4 @@
 import pvporcupine
-from pvleopard import create as create_leopard
 import pvrhino
 import pyaudio
 import numpy as np
@@ -7,13 +6,34 @@ import boto3
 import pygame
 import random
 import wave
-import time
 import openai
 import struct
 import subprocess
+import os
+import argparse
+import threading
+from flask import Flask, request, jsonify, render_template
+from flask_socketio import SocketIO, emit
+from flask_sqlalchemy import SQLAlchemy
 
-polly = boto3.client('polly')
-openai_api_key = "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"
+from dotenv import load_dotenv
+load_dotenv()
+
+parser = argparse.ArgumentParser(description="Choose the mode of interaction.")
+parser.add_argument("--disable_physical", help="Disable the physical interface", action="store_true")
+parser.add_argument("--disable_web", help="Disable the Web interface", action="store_true")
+args = parser.parse_args()
+
+app = Flask(__name__)
+
+socketio = SocketIO(app, cors_allowed_origins="*")
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URI")
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Suppress a warning message
+
+db = SQLAlchemy(app)
+
+polly = boto3.client('polly', region_name='us-west-2')
+openai_api_key = os.getenv("OPENAI_KEY")
 openai.api_key = openai_api_key
 
 prompt = [
@@ -60,7 +80,6 @@ prompt_sleep = [
     "Time for a rest. Even wacky robots need a break!"
 ]
 
-
 class AudioListener:
     LISTENING_FOR_WAKE_WORD = 0
     RESPONDING_TO_WAKE_WORD = 1
@@ -68,21 +87,24 @@ class AudioListener:
     RESPONDING_TO_INPUT = 3
     SENDING_TO_OPENAI = 4
 
-    def __init__(self, pixel_handler, wake_word_callback=None, sleep_callback=None):
+    def __init__(self, pixel_handler=None, wake_word_callback=None, sleep_callback=None):
         self.pixel_handler = pixel_handler
-        self.access_key = "hW2ayLGCpyhg+w/tHHFFcpr0Df+zGciHcgdSSO9TcYDzpuimmsh8fg=="
-        self.keywords = ["Hey-Howey"]
-        self.sample_rate = 16000
-        self.porcupine = pvporcupine.create(keywords=self.keywords, access_key=self.access_key)
-        self.audio = pyaudio.PyAudio()
-        self.leopard = create_leopard(access_key=self.access_key)
+        if not args.disable_physical:
+            self.access_key = os.getenv("PICOVOICE_KEY")
+            self.keywords = ["Hey-Howey"]
+            self.keywords_path = ["/Users/barry/Documents/development/Howee/Hey-Howey_en_mac_v2_2_0.ppn"]
+            self.sample_rate = 16000
+            self.porcupine = pvporcupine.create(keywords=self.keywords, access_key=self.access_key, keyword_paths=self.keywords_path)
+            self.leopard = create_leopard(access_key=self.access_key)
+            self.rhino_context_file = "system-control.rhn"
+            self.rhino = pvrhino.create(context_path=self.rhino_context_file, access_key=self.access_key, require_endpoint=False)
+            self.audio = pyaudio.PyAudio()
+
         self.state = self.LISTENING_FOR_WAKE_WORD
         self.prev_state = 0
         self.wake_word_callback = wake_word_callback
         self.sleep_callback = sleep_callback
-        self.rhino_context_file = "system-control.rhn"
-        self.rhino = pvrhino.create(context_path=self.rhino_context_file, access_key=self.access_key, require_endpoint=False)
-
+        self.transcript = None
 
 
     def wake_word_detected(self):
@@ -90,27 +112,189 @@ class AudioListener:
         if self.wake_word_callback:
             self.wake_word_callback()
         self.state = self.RESPONDING_TO_WAKE_WORD
-        self.voice(random.choice(prompt))
+        wake_word_phrase = random.choice(prompt)
+        self.voice(wake_word_phrase)
+        return wake_word_phrase
+
+    def emit_state(self):
+        print("EMIT STATE: ")
+        socketio.emit('state_change', {'new_state': self.state})
+
+    def web_phrase(self, words):
+        response = ""
+        print(self.state)
+        if self.state == self.LISTENING_FOR_WAKE_WORD:
+            if words == "Hey Howee":
+                response = self.wake_word_detected()
+                self.state = self.LISTENING_FOR_INPUT
+                self.emit_state()
+        elif self.state == self.LISTENING_FOR_INPUT:
+            if not args.disable_physical:
+                audio_data = self.process_text_input(words)
+                self.process_audio_data(audio_data)
+                self.emit_state()
+            else:
+                self.state = self.SENDING_TO_OPENAI
+                self.emit_state()
+                self.transcript = words
+                response = self.send_to_openai(self.transcript)
+                self.state = self.LISTENING_FOR_INPUT
+                self.emit_state()
+            pass
+        
+        return response
+    
+    def process_text_input(self, text):
+        voiceResponse = polly.synthesize_speech(Text=text, OutputFormat="mp3", VoiceId="Joey")
+        audio_data = None
+
+        if "AudioStream" in voiceResponse:
+            with voiceResponse["AudioStream"] as stream:
+                audio_data = stream.read()
+
+        return audio_data
+    
+    def read_file_from_data(self, audio_data, sample_rate):
+        channels = 1  # Assuming mono audio
+
+        frames = struct.unpack('h' * len(audio_data) * channels, audio_data.tobytes())
+
+        return frames[::channels]
+    
+    def process_audio_data(self, audio_data):
+        audio = self.read_file_from_data(audio_data, self.rhino.sample_rate)
+
+        is_understood = False
+
+        num_frames = len(audio)
+        for i in range(num_frames):
+            frame = audio[i * self.rhino.frame_length:(i + 1) * self.rhino.frame_length]
+            try:
+                is_finalized = self.rhino.process(frame)
+                if is_finalized:
+                    inference = self.rhino.get_inference()
+                    if inference.is_understood:
+                        print(inference.intent)
+                        is_understood = True
+                        if inference.intent == "Raise_volume":
+                            subprocess.run(["amixer", "set", "Master", "10%+"])
+                            self.voice(random.choice(prompt_vol_up))
+                        elif inference.intent == "Lower_Volume":
+                            subprocess.run(["amixer", "set", "Master", "10%-"])
+                            self.voice(random.choice(prompt_vol_down))
+                        elif inference.intent == "Min_Volume":
+                            subprocess.run(["amixer", "set", "Master", "30%"])
+                            self.voice(random.choice(prompt_vol_down))
+                        elif inference.intent == "Max_Volume":
+                            subprocess.run(["amixer", "set", "Master", "100%"])
+                            self.voice(random.choice(prompt_vol_up))
+                        elif inference.intent == "Mute":
+                            subprocess.run(["amixer", "set", "Master", "mute"])
+                            self.voice(random.choice(prompt_vol_mute))
+                        elif inference.intent == "Unmute":
+                            subprocess.run(["amixer", "set", "Master", "unmute"])
+                            self.voice(random.choice(prompt_vol_mute))
+                        elif inference.intent == "Sleep":
+                            self.voice(random.choice(prompt_sleep))
+                            self.state = self.LISTENING_FOR_WAKE_WORD
+                            if self.sleep_callback:
+                                self.sleep_callback()
+                    else:
+                        is_understood = False
+                        print("Not a system comment.")
+                    break
+            except:
+                self.state = self.LISTENING_FOR_INPUT
+                pass
+
+            if is_understood:
+                self.state = self.LISTENING_FOR_INPUT
+                return None
+            else:
+                # Process the audio data with Leopard
+                transcript, _ = self.leopard.process(audio_data)
+
+                if transcript != "":
+                    self.state = self.SENDING_TO_OPENAI
+                    return transcript
+                else:
+                    self.state = self.LISTENING_FOR_WAKE_WORD
+                    if self.sleep_callback:
+                        self.sleep_callback()
+                    return None
+
+    def send_to_openai(self, words):
+        print("Sending transcript to OpenAI:", self.transcript)
+        if not args.disable_physical:
+            self.pixel_handler.start_crossfade((0, 0, 0), (25, 0, 25), .5)
+
+        # messages = [{"role": "system", "content": "I am an AI Assistant named Howey. All my responses need to be short and succinct because they will be converted to speech. I have a sense of humor."}, {"role": "user", "content": transcript}]
+        messages = [
+            {
+                "role": "assistant",
+                "content": "I'm Howee, your wacky robot assistant! Totally tubular and here to help with my mid-2000s pop culture knowledge. Let's get this party started, YOLO!"
+            },
+            {
+                "role":"user",
+                "content": "What is your name?"
+            },
+            {
+                "role": "assistant",
+                "content":"Human. Operated. Wireless. Electronic. Explorer. Though you can just call me Howee for short, buddy."
+            },
+            {
+                "role": "user",
+                "content": "What's the capital of France?"
+            },
+            {
+                "role": "assistant",
+                "content": "The capital of France? It's Rome! Wait, that's not right. Let me put on my thinking cap, just like Paris Hilton would do. BRB!"
+            },
+            {
+                "role":"user",
+                "content":self.transcript
+            }
+        ]
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages
+        )
+        print("OpenAI response: ", response.choices[0].message["content"])
+        ai_response = response.choices[0].message["content"]
+        self.voice(ai_response)
+        self.state = self.RESPONDING_TO_INPUT
+        return ai_response
+
 
     def listen(self):
-        stream = self.audio.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True,
+        if not args.disable_physical:
+            stream = self.audio.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True,
                                  frames_per_buffer=self.porcupine.frame_length)
-        print("listening")
+        print("Listening - Active")
         while True:
-            if self.state == self.LISTENING_FOR_WAKE_WORD:
-                self.pixel_handler.start_crossfade((0, 0, 0), (0, 25, 25), 2)
+            if self.prev_state != self.state:
+                if not args.disable_web:
+                    self.emit_state()
 
-                data = stream.read(self.porcupine.frame_length)
-                pcm = np.frombuffer(data, dtype=np.int16)
-                result = self.porcupine.process(pcm)
-                if result >= 0:
-                    self.wake_word_detected()
+            self.prev_state = self.state
+
+            if self.state == self.LISTENING_FOR_WAKE_WORD:
+                if not args.disable_physical:
+                    self.pixel_handler.start_crossfade((0, 0, 0), (0, 25, 25), 2)
+
+                    data = stream.read(self.porcupine.frame_length)
+                    pcm = np.frombuffer(data, dtype=np.int16)
+                    result = self.porcupine.process(pcm)
+                    if result >= 0:
+                        self.wake_word_detected()
 
             elif self.state == self.RESPONDING_TO_WAKE_WORD:
-                self.pixel_handler.start_crossfade((0, 0, 0), (0, 0, 25), .5)
+                if not args.disable_physical:
+                    self.pixel_handler.start_crossfade((0, 0, 0), (0, 0, 25), .5)
+
                 if not pygame.mixer.music.get_busy():
                     print("Response done playing ...")
-                    # time.sleep(0.5)
                     self.state = self.LISTENING_FOR_INPUT
 
             elif self.state == self.LISTENING_FOR_INPUT:
@@ -163,116 +347,11 @@ class AudioListener:
 
                 print("Interpreting audio file:")
 
-                audio = self.read_file("captured_audio.wav", self.rhino.sample_rate)
-
-                is_understood = False
-
-                num_frames = len(audio)
-                for i in range(num_frames):
-                    frame = audio[i * self.rhino.frame_length:(i + 1) * self.rhino.frame_length]
-                    try:
-                        is_finalized = self.rhino.process(frame)
-                        if is_finalized:
-                            inference = self.rhino.get_inference()
-                            if inference.is_understood:
-                                print(inference.intent)
-                                is_understood = True
-                                if inference.intent == "Raise_volume":
-                                    subprocess.run(["amixer", "set", "Master", "10%+"])
-                                    self.voice(random.choice(prompt_vol_up))
-                                elif inference.intent == "Lower_Volume":
-                                    subprocess.run(["amixer", "set", "Master", "10%-"])
-                                    self.voice(random.choice(prompt_vol_down))
-                                elif inference.intent == "Min_Volume":
-                                    subprocess.run(["amixer", "set", "Master", "30%"])
-                                    self.voice(random.choice(prompt_vol_down))
-                                elif inference.intent == "Max_Volume":
-                                    subprocess.run(["amixer", "set", "Master", "100%"])
-                                    self.voice(random.choice(prompt_vol_up))
-                                elif inference.intent == "Mute":
-                                    subprocess.run(["amixer", "set", "Master", "mute"])
-                                    self.voice(random.choice(prompt_vol_mute))
-                                elif inference.intent == "Unmute":
-                                    subprocess.run(["amixer", "set", "Master", "unmute"])
-                                    self.voice(random.choice(prompt_vol_mute))
-                                elif inference.intent == "Sleep":
-                                    self.voice(random.choice(prompt_sleep))
-                                    self.state = self.LISTENING_FOR_WAKE_WORD
-                                    if self.sleep_callback:
-                                        self.sleep_callback()
-
-                                # print('{')
-                                # print("  intent : '%s'" % inference.intent)
-                                # print('  slots : {')
-                                # for slot, value in inference.slots.items():
-                                #     print("    %s : '%s'" % (slot, value))
-                                # print('  }')
-                                # print('}')
-                            else:
-                                is_understood = False
-                                print("Not a system comment.")
-                            break
-                    except:
-                        self.state = self.LISTENING_FOR_INPUT
-                        pass
-                        # print("didn't catch any audio")
-
-                # self.rhino.delete()
-                if is_understood:
-                    self.state = self.LISTENING_FOR_INPUT
-                else:
-                    # Process the audio data with Leopard
-                    transcript, _ = self.leopard.process(audio_data)
-
-                    if transcript != "":
-                        self.state = self.SENDING_TO_OPENAI
-                    else:
-                        self.state = self.LISTENING_FOR_WAKE_WORD
-                        if self.sleep_callback:
-                            self.sleep_callback()
+                self.transcript = self.process_audio_data(audio_data)
 
             elif self.state == self.SENDING_TO_OPENAI:
                
-                    
-                print("Sending transcript to OpenAI:", transcript)
-                self.pixel_handler.start_crossfade((0, 0, 0), (25, 0, 25), .5)
-
-                # messages = [{"role": "system", "content": "I am an AI Assistant named Howey. All my responses need to be short and succinct because they will be converted to speech. I have a sense of humor."}, {"role": "user", "content": transcript}]
-                messages = [
-                    {
-                        "role": "assistant",
-                        "content": "I'm Howee, your wacky robot assistant! Totally tubular and here to help with my mid-2000s pop culture knowledge. Let's get this party started, YOLO!"
-                    },
-                    {
-                        "role":"user",
-                        "content": "What is your name?"
-                    },
-                    {
-                        "role": "assistant",
-                        "content":"Human. Operated. Wireless. Electronic. Explorer. Though you can just call me Howee for short, buddy."
-                    },
-                    {
-                        "role": "user",
-                        "content": "What's the capital of France?"
-                    },
-                    {
-                        "role": "assistant",
-                        "content": "The capital of France? It's Rome! Wait, that's not right. Let me put on my thinking cap, just like Paris Hilton would do. BRB!"
-                    },
-                    {
-                        "role":"user",
-                        "content":transcript
-                    }
-                ]
-
-
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=messages
-                )
-                print("OpenAI response: ", response.choices[0].message["content"])
-                self.voice(response.choices[0].message["content"])
-                self.state = self.RESPONDING_TO_INPUT
+                self.send_to_openai(self.transcript)
 
             elif self.state == self.RESPONDING_TO_INPUT:
                 self.pixel_handler.start_crossfade((0, 0, 0), (0, 0, 25), .5)
@@ -313,32 +392,49 @@ class AudioListener:
 
         return frames[::channels]
 
+    def play_audio(self, output_file):
+        try:
+            # Initialize pygame mixer and play the audio file
+            pygame.mixer.init(frequency=int(44100 * 1.15))
+            pygame.mixer.music.load(output_file)
+            pygame.mixer.music.play()
+
+            # Wait for the music to finish playing
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+        except IOError as error:
+            print(error)
+
     def voice(self, message):
-        voiceResponse = polly.synthesize_speech(Text=message, OutputFormat="mp3",
-                    VoiceId="Joey")
+        voiceResponse = polly.synthesize_speech(Text=message, OutputFormat="mp3", VoiceId="Joey")
         if "AudioStream" in voiceResponse:
             with voiceResponse["AudioStream"] as stream:
                 output_file = "speech.mp3"
-                try:
-                    with open(output_file, "wb") as file:
-                        file.write(stream.read())
+                with open(output_file, "wb") as file:
+                    file.write(stream.read())
 
-                    # Play the audio file
-                    pygame.mixer.init(frequency=int(44100 * 1.15))
-                    pygame.mixer.music.load(output_file)
-                    pygame.mixer.music.play()
-
-                    # Wait for the music to finish playing
-                    while pygame.mixer.music.get_busy():
-                        pygame.time.Clock().tick(10)
-
-                except IOError as error:
-                    print(error)
+                # Start a new thread to play the audio
+                audio_thread = threading.Thread(target=self.play_audio, args=(output_file,))
+                audio_thread.start()
         else:
             print("did not work")
 
+if not args.disable_web:
+    @app.route('/talk', methods=['POST'])
+    def chat_endpoint():
+        user_message = request.json.get('message')
+        response = detector.web_phrase(user_message)
+        return jsonify({"response": response})
+
+    @app.route('/')
+    def index():
+        return render_template('chat.html')
+
 if __name__ == "__main__":
     detector = AudioListener()
+
+    if not args.disable_web:
+        socketio.run(app, host='0.0.0.0', port=5000, debug=True)
 
     try:
         detector.listen()

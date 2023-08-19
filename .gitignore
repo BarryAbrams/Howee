@@ -1,0 +1,5 @@
+.env
+.passwords
+captured_audio.wav
+speech.mp3
+flask
