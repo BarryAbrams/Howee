@@ -16,6 +16,13 @@ import threading
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy_serializer import SerializerMixin
+import spacy
+from fuzzywuzzy import fuzz
+import platform
+import json
+from sqlalchemy import or_
+
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -32,10 +39,19 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URI")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Suppress a warning message
 
 db = SQLAlchemy(app)
+nlp = spacy.load("en_core_web_sm")
 
 polly = boto3.client('polly', region_name='us-west-2')
 openai_api_key = os.getenv("OPENAI_KEY")
 openai.api_key = openai_api_key
+
+class Conversation(db.Model, SerializerMixin):
+    serialize_only = ('id', 'content', 'response', 'topics')
+    
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.String(500))
+    response = db.Column(db.String(500))
+    topics = db.Column(db.JSON)
 
 prompt = [
     "Ready to mix things up? How can I help?",
@@ -121,28 +137,161 @@ class AudioListener:
         print("EMIT STATE: ")
         socketio.emit('state_change', {'new_state': self.state})
 
+    def is_wake_word(self, words):
+        words = words.lower().strip()
+        
+        common_phrases = [
+            "hey howee",
+            "howee, wake",
+            "wake up howee",
+            "hey howe",
+            "he yhowee"
+        ]
+        
+        # Check if the input matches closely with any of the common phrases
+        for phrase in common_phrases:
+            if fuzz.ratio(words, phrase) > 80:  # 80 is a threshold, adjust as needed
+                return True
+        return False
+    
+    def handle_system_command(self, command):
+        """Handle system commands based on the intent."""
+        # Dictionary mapping of intents to their corresponding functions and common permutations
+        system_commands = {
+            "Raise_volume": {
+                "function": self.raise_volume,
+                "phrases": ["volume up", "increase volume", "turn up the volume", "louder"]
+            },
+            "Lower_Volume": {
+                "function": self.lower_volume,
+                "phrases": ["volume down", "decrease volume", "turn down the volume", "softer"]
+            },
+            "Min_Volume": {
+                "function": self.min_volume,
+                "phrases": ["minimum volume", "set volume to minimum", "lowest volume"]
+            },
+            "Max_Volume": {
+                "function": self.max_volume,
+                "phrases": ["maximum volume", "set volume to maximum", "highest volume"]
+            },
+            "Mute": {
+                "function": self.mute,
+                "phrases": ["mute", "mute volume", "silence"]
+            },
+            "Unmute": {
+                "function": self.unmute,
+                "phrases": ["unmute", "unmute volume", "restore sound"]
+            },
+            "Sleep": {
+                "function": self.go_to_sleep,
+                "phrases": ["go to sleep", "sleep mode", "rest", "shut down"]
+            }
+        }
+
+        # Iterate through each intent
+        for intent, details in system_commands.items():
+            # Check each phrase for a match with the input command
+            for phrase in details["phrases"]:
+                if fuzz.ratio(command.lower(), phrase.lower()) > 80:  # 80 is a threshold, adjust as needed
+                    # If a match is found, execute the corresponding function
+                    return details["function"]()
+
+        # If the command isn't a system command, send it to OpenAI
+        return self.send_to_openai_howee(command)
+
+    def adjust_volume_mac(self, adjustment=None, target_volume=None):
+        """Adjust the volume on macOS."""
+        if target_volume is not None:
+            # Set to specific volume level
+            subprocess.run(["osascript", "-e", f"set volume output volume {target_volume}"])
+            return target_volume
+        elif adjustment:
+            # Get the current volume level
+            result = subprocess.run(["osascript", "-e", "output volume of (get volume settings)"], capture_output=True)
+            current_volume = int(result.stdout.decode().strip())
+            
+            # Calculate the new volume based on the adjustment
+            new_volume = current_volume + adjustment
+            new_volume = min(max(new_volume, 0), 100)  # Ensure it's between 0 and 100
+            
+            # Set the new volume level
+            subprocess.run(["osascript", "-e", f"set volume output volume {new_volume}"])
+            return new_volume
+
+    def raise_volume(self):
+        if platform.system() == "Darwin":  # macOS
+            self.adjust_volume_mac(10)
+        else:  # Assuming Raspberry Pi or other Linux systems
+            subprocess.run(["amixer", "set", "Master", "10%+"])
+        response = random.choice(prompt_vol_up)
+        self.voice(response)
+        return response
+
+    def lower_volume(self):
+        if platform.system() == "Darwin":
+            self.adjust_volume_mac(-10)
+        else:
+            subprocess.run(["amixer", "set", "Master", "10%-"])
+        response = random.choice(prompt_vol_down)
+        self.voice(response)
+        return response
+
+    def min_volume(self):
+        if platform.system() == "Darwin":
+            self.adjust_volume_mac(target_volume=30)
+        else:
+            subprocess.run(["amixer", "set", "Master", "30%"])
+        response = random.choice(prompt_vol_down)
+        self.voice(response)
+        return response
+
+    def max_volume(self):
+        if platform.system() == "Darwin":
+            self.adjust_volume_mac(target_volume=100)
+        else:
+            subprocess.run(["amixer", "set", "Master", "100%"])
+        response = random.choice(prompt_vol_up)
+        self.voice(response)
+        return response
+
+    def mute(self):
+        if platform.system() == "Darwin":
+            subprocess.run(["osascript", "-e", "set volume output muted true"])
+        else:
+            subprocess.run(["amixer", "set", "Master", "mute"])
+        response = random.choice(prompt_vol_mute)
+        self.voice(response)
+        return response
+
+    def unmute(self):
+        if platform.system() == "Darwin":
+            subprocess.run(["osascript", "-e", "set volume output muted false"])
+        else:
+            subprocess.run(["amixer", "set", "Master", "unmute"])
+        response = random.choice(prompt_vol_mute)
+        self.voice(response)
+        return response
+
+    def go_to_sleep(self):
+        self.voice(random.choice(prompt_sleep))
+        self.state = self.LISTENING_FOR_WAKE_WORD
+        if self.sleep_callback:
+            self.sleep_callback()
+
     def web_phrase(self, words):
         response = ""
         print(self.state)
         if self.state == self.LISTENING_FOR_WAKE_WORD:
-            if words == "Hey Howee":
+            if self.is_wake_word(words):
                 response = self.wake_word_detected()
                 self.state = self.LISTENING_FOR_INPUT
                 self.emit_state()
-        elif self.state == self.LISTENING_FOR_INPUT:
-            if not args.disable_physical:
-                audio_data = self.process_text_input(words)
-                self.process_audio_data(audio_data)
-                self.emit_state()
             else:
-                self.state = self.SENDING_TO_OPENAI
-                self.emit_state()
-                self.transcript = words
-                response = self.send_to_openai(self.transcript)
-                self.state = self.LISTENING_FOR_INPUT
-                self.emit_state()
-            pass
-        
+                response = "Howee is asleep, say Hey Howee to wake him up"
+        elif self.state == self.LISTENING_FOR_INPUT:
+            response = self.handle_system_command(words)
+            self.state = self.LISTENING_FOR_INPUT
+            self.emit_state()
         return response
     
     def process_text_input(self, text):
@@ -224,36 +373,35 @@ class AudioListener:
                         self.sleep_callback()
                     return None
 
-    def send_to_openai(self, words):
-        print("Sending transcript to OpenAI:", self.transcript)
-        if not args.disable_physical:
-            self.pixel_handler.start_crossfade((0, 0, 0), (25, 0, 25), .5)
 
-        # messages = [{"role": "system", "content": "I am an AI Assistant named Howey. All my responses need to be short and succinct because they will be converted to speech. I have a sense of humor."}, {"role": "user", "content": transcript}]
+    def find_in_database(self, topics):
+        if topics is None:
+            print("Warning: topics is None!")
+            return []
+
+        with app.app_context():
+            # Construct a single query to match any of the topics
+            filters = or_(*[Conversation.topics.contains(topic) for topic in topics])
+            related_conversations = Conversation.query.filter(filters).all()
+
+            return related_conversations
+
+        
+    def send_to_openai_topics(self, words):
+        print("Getting topics from open ai:", words)
+
         messages = [
-            {
-                "role": "assistant",
-                "content": "I'm Howee, your wacky robot assistant! Totally tubular and here to help with my mid-2000s pop culture knowledge. Let's get this party started, YOLO!"
+             {
+                "role": "system",
+                "content": str('You interpret intent and topics from a passage of text. Return a min of 0 topics and a max of 4.')
             },
             {
                 "role":"user",
-                "content": "What is your name?"
+                "content":words
             },
             {
-                "role": "assistant",
-                "content":"Human. Operated. Wireless. Electronic. Explorer. Though you can just call me Howee for short, buddy."
-            },
-            {
-                "role": "user",
-                "content": "What's the capital of France?"
-            },
-            {
-                "role": "assistant",
-                "content": "The capital of France? It's Rome! Wait, that's not right. Let me put on my thinking cap, just like Paris Hilton would do. BRB!"
-            },
-            {
-                "role":"user",
-                "content":self.transcript
+                "role": "system",
+                "content": str('You always respond with a JSON response, matching the format {"topics":["topicA","topicB","topicC"]}. This JSON should be the ONLY thing in your final response.')
             }
         ]
 
@@ -261,12 +409,76 @@ class AudioListener:
             model="gpt-3.5-turbo",
             messages=messages
         )
-        print("OpenAI response: ", response.choices[0].message["content"])
-        ai_response = response.choices[0].message["content"]
+        response_text = response.choices[0].message["content"]
+        start_index = response_text.rfind('{')
+        json_part = response_text[start_index:]
+        response_dict = json.loads(json_part)
+        return response_dict
+
+    def send_to_openai_howee(self, words):
+        topics = self.send_to_openai_topics(words)
+
+        if not args.disable_physical:
+            self.pixel_handler.start_crossfade((0, 0, 0), (25, 0, 25), .5)
+
+        print("Returned Topics:", topics['topics'])
+
+        prev_conversations = self.find_in_database(topics['topics'])
+        print(prev_conversations)
+        print("Sending transcript to OpenAI:", words)
+
+
+        messages = [
+             {
+                "role": "system",
+                "content": str('You are Howee, the wacky robot assistant! Howee stands for Human. Operated. Wireless. Electronic. Explorer. You are totally tubular and equipped with mid-2000s pop culture knowledge. Remember to assist with that vibe. Lets get this party started. YOLO! ')
+            }]
+        
+
+        messages.append({
+                "role":"user",
+                "content":words
+            }
+        )
+
+        for prev_conversation in prev_conversations:
+            prev_prompt = prev_conversation.content
+            messages.append({
+                "role": "system",
+                "content": f'For context, previously we have discussed this topic. Here is the previous prompt: I said: "{prev_prompt}"'
+            })
+
+
+        messages.append( {
+                "role": "system",
+                "content": str('You always respond with a JSON response, matching the format {"response":"This is my response which covered topicA, topicB, topicC", "topics":["topicA","topicB","topicC"]} where "response" is the totality of the written response and the topics are the broad ideas brought up in the response. This JSON should be the ONLY thing in your final response. The responses need to be concise because they will be read out loud.')
+            }
+        )
+
+        print(messages)
+
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=messages
+        )
+        response_text = response.choices[0].message["content"]
+        start_index = response_text.rfind('{')
+        json_part = response_text[start_index:]
+        response_dict = json.loads(json_part)
+
+        content = response_dict["response"]
+        topics = response_dict["topics"]
+
+        print("OpenAI response: ", content)
+        ai_response = content
         self.voice(ai_response)
         self.state = self.RESPONDING_TO_INPUT
-        return ai_response
 
+        conversation = Conversation(content=words, response=ai_response, topics=topics)
+        db.session.add(conversation)
+        db.session.commit()
+
+        return ai_response
 
     def listen(self):
         if not args.disable_physical:
@@ -352,7 +564,7 @@ class AudioListener:
 
             elif self.state == self.SENDING_TO_OPENAI:
                
-                self.send_to_openai(self.transcript)
+                self.send_to_openai_howee(self.transcript)
 
             elif self.state == self.RESPONDING_TO_INPUT:
                 self.pixel_handler.start_crossfade((0, 0, 0), (0, 0, 25), .5)
