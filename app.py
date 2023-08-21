@@ -12,7 +12,9 @@ import time
 # def index():
 #     return render_template('index.html')
 
-if platform.machine() in ['armv7l', 'armv6l']:
+print(platform.machine())
+
+if platform.machine() in ['aarch64', 'armv6l']:
     from person_sensor import PersonSensor
     from pixels import Pixels
     pixel_handler = Pixels()
@@ -40,7 +42,7 @@ else:
 def run_audio_listener():
     global pixel_handler
     # listener = AudioListener()
-    if platform.machine() in ['armv7l', 'armv6l']:
+    if platform.machine() in ['aarch64', 'armv6l']:
         listener = AudioListener(pixel_handler=pixel_handler, wake_word_callback=servo_hat.activate, sleep_callback=servo_hat.deactivate)  # Pass the activate method as a callback
     else:
         listener = AudioListener()

@@ -1,6 +1,7 @@
 import pvporcupine
 import pvrhino
 import pyaudio
+from pvleopard import create as create_leopard
 import numpy as np
 import boto3
 import pygame
@@ -88,17 +89,17 @@ class AudioListener:
     SENDING_TO_OPENAI = 4
 
     def __init__(self, pixel_handler=None, wake_word_callback=None, sleep_callback=None):
-        self.pixel_handler = pixel_handler
         if not args.disable_physical:
             self.access_key = os.getenv("PICOVOICE_KEY")
             self.keywords = ["Hey-Howey"]
-            self.keywords_path = ["/Users/barry/Documents/development/Howee/Hey-Howey_en_mac_v2_2_0.ppn"]
             self.sample_rate = 16000
-            self.porcupine = pvporcupine.create(keywords=self.keywords, access_key=self.access_key, keyword_paths=self.keywords_path)
+            self.porcupine = pvporcupine.create(keywords=self.keywords, access_key=self.access_key)
             self.leopard = create_leopard(access_key=self.access_key)
             self.rhino_context_file = "system-control.rhn"
             self.rhino = pvrhino.create(context_path=self.rhino_context_file, access_key=self.access_key, require_endpoint=False)
             self.audio = pyaudio.PyAudio()
+            
+        self.pixel_handler = pixel_handler
 
         self.state = self.LISTENING_FOR_WAKE_WORD
         self.prev_state = 0

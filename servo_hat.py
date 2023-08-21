@@ -11,8 +11,8 @@ class PiServoHatWrapper:
         self.y_axis = ServoController(self, 1, 30, 120)
         self.rt_eyelid = ServoController(self, 2, 120, 0)
         self.lt_eyelid = ServoController(self, 4, 0, 120)
-        self.rb_eyelid = ServoController(self, 3, 45, 160)
-        self.lb_eyelid = ServoController(self, 5, 100, 0)
+        self.rb_eyelid = ServoController(self, 3, 25, 180)
+        self.lb_eyelid = ServoController(self, 5, 120, 0)
 
         self.last_move_time = 0
         self.last_center_x = None
@@ -79,9 +79,9 @@ class PiServoHatWrapper:
                 return
 
             # Check if the change is substantial
-            if self.last_center_x is not None and self.last_center_y is not None:
-                if abs(center_x - self.last_center_x) < 0.05 and abs(center_y - self.last_center_y) < 0.05:
-                    return
+            # if self.last_center_x is not None and self.last_center_y is not None:
+            #     if abs(center_x - self.last_center_x) < 0.05 and abs(center_y - self.last_center_y) < 0.05:
+            #         return
 
             self.move_eyes(center_x, center_y)
 
@@ -124,7 +124,7 @@ class PiServoHatWrapper:
         eye_positions = [(self.x_axis, inverted_x), (self.y_axis, inverted_y)]
         eyelid_positions = self.calculate_eyelid_positions(inverted_y)
         servo_positions = eye_positions + eyelid_positions
-        smooth_move_servos(servo_positions, 75)
+        smooth_move_servos(servo_positions, 15)
 
     def calculate_eyelid_positions(self, y_position):
         offset = (y_position - 0.5) * 0.5
@@ -139,7 +139,9 @@ class ServoController:
         self.min_angle = min_angle
         self.max_angle = max_angle
         self.servo_hat = servo_hat
-        self.current_angle = None  # Initialize current_angle
+        self.current_angle = (self.min_angle + self.max_angle) / 2  # Initialize to midpoint of range
+        self.previous_smoothed_position = self.get_current_position()  # Initialize with current position
+        self.alpha = 0.05  # You can adjust this value for desired smoothness
         self.move_to_center()
 
     def get_current_position(self):
@@ -169,38 +171,48 @@ class ServoController:
         angle = self.min_angle + position * angle_range
         self.move_to_angle(angle)
 
-    def smooth_move_to_position(self, target_position, steps_per_unit=100):
-        current_position = self.get_current_position()
-        distance = abs(target_position - current_position)
-        steps = int(steps_per_unit * distance)
+    def smooth_move_to_position(self, target_position, duration=1.0):
+        start_time = time.time()
+        end_time = start_time + duration
 
-        # If there's no distance to cover, simply set the target position and return
-        if steps == 0:
-            self.move_to_position(target_position)
-            return
+        print("smooth move to position")
 
-        for step in range(steps + 1):
-            t = step / steps  # Normalized time from 0 to 1
-            # Apply cubic easing function for smooth start and end
-            eased_t = t**2 * (3 - 2 * t)
-            position = current_position + eased_t * (target_position - current_position)
-            self.move_to_position(position)
+        while time.time() < end_time:
+            elapsed_time = time.time() - start_time
+            t = elapsed_time / duration
+            desired_position = self.get_current_position() + t * (target_position - self.get_current_position())
+
+            # Apply the smoothing (EMA) algorithm
+            smoothed_position = (desired_position * self.alpha) + (self.previous_smoothed_position * (1 - self.alpha))
+
+            self.move_to_position(smoothed_position)
+            self.previous_smoothed_position = smoothed_position  # Update the previous value
+
             time.sleep(0.01)  # Adjust the sleep time for the desired speed
 
         # Ensure the final position is reached
         self.move_to_position(target_position)
 
 
-
-def smooth_move_servos(servo_positions, steps=100, max_acceleration=0.01):
+def smooth_move_servos(servo_positions, steps=100, delay_time=0.01):
     def move_servo(servo, target_position):
-        servo.smooth_move_to_position(target_position, steps)
-
+        current_position = servo.get_current_position()
+        
+        for step in range(steps + 1):
+            t = step / steps
+            eased_t = t**2 * (3 - 2 * t)
+            position = current_position + eased_t * (target_position - current_position)
+            servo.move_to_position(position)
+            time.sleep(delay_time)
+        
+        servo.move_to_position(target_position)
+    
     threads = [threading.Thread(target=move_servo, args=sp) for sp in servo_positions]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
+
 
 # servo_hat = PiServoHatWrapper(100)
 
