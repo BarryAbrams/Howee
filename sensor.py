@@ -31,8 +31,15 @@ I2C_PERIPHERAL = 0x703
 # How long to pause between sensor polls.
 PERSON_SENSOR_DELAY = 0.2
 
-i2c_handle = io.open("/dev/i2c-" + str(I2C_CHANNEL), "rb", buffering=0)
+i2c_handle = io.open("/dev/i2c-" + str(I2C_CHANNEL), "rb+", buffering=0)  # Note the change to "rb+" to allow writing
 fcntl.ioctl(i2c_handle, I2C_PERIPHERAL, PERSON_SENSOR_I2C_ADDRESS)
+
+# Set Debug Mode to False
+DEBUG_MODE_ADDRESS = 0x07
+DEBUG_MODE_VALUE = 0x00  # False
+i2c_handle.write(bytearray([DEBUG_MODE_ADDRESS, DEBUG_MODE_VALUE]))
+
+
 
 while True:
     try:

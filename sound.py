@@ -1,31 +1,30 @@
-import pvporcupine
-import pvrhino
-import pyaudio
+# Standard Libraries
+import os, random, wave, struct, subprocess, argparse, threading, platform, json, sys
+
+# Suppress the pygame startup message
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = '1'
+
+# Audio Libraries
+import pvporcupine, pvrhino, pyaudio, pygame
 from pvleopard import create as create_leopard
-import numpy as np
 import boto3
-import pygame
-import random
-import wave
+
+# AI Libraries
 import openai
-import struct
-import subprocess
-import os
-import argparse
-import threading
+
+# Flask/SQL Libraries
 from flask import Flask, request, jsonify, render_template
 from flask_socketio import SocketIO, emit
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy_serializer import SerializerMixin
-import spacy
-from fuzzywuzzy import fuzz
-import platform
-import json
 from sqlalchemy import or_
 
-
+# Miscellaneous Libraries
+from fuzzywuzzy import fuzz
 from dotenv import load_dotenv
+import numpy as np
 load_dotenv()
+
 
 parser = argparse.ArgumentParser(description="Choose the mode of interaction.")
 parser.add_argument("--disable_physical", help="Disable the physical interface", action="store_true")
@@ -39,7 +38,6 @@ app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv("DATABASE_URI")
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False  # Suppress a warning message
 
 db = SQLAlchemy(app)
-nlp = spacy.load("en_core_web_sm")
 
 polly = boto3.client('polly', region_name='us-west-2')
 openai_api_key = os.getenv("OPENAI_KEY")
@@ -56,7 +54,7 @@ class Conversation(db.Model, SerializerMixin):
 prompt = [
     "Ready to mix things up? How can I help?",
     "Need a hand? Or maybe a wrong answer?",
-    "What can this wacky robot do for you?",
+    "What can this robot do for you?",
     "Ask me anything! I may not know, but I'll try!",
     "Yes? What's the next adventure?",
     "I'm here. Probably not all there, but here!",
@@ -94,7 +92,7 @@ prompt_sleep = [
     "I am feeling pretty tired. Do robots get tired? I guess I do!",
     "Sleep mode activated. Or is it? Let's find out!",
     "Do robots dream? Guess I'll find out soon!",
-    "Time for a rest. Even wacky robots need a break!"
+    "Time for a rest. Even robots need a break!"
 ]
 
 class AudioListener:
@@ -104,14 +102,14 @@ class AudioListener:
     RESPONDING_TO_INPUT = 3
     SENDING_TO_OPENAI = 4
 
-    def __init__(self, pixel_handler=None, wake_word_callback=None, sleep_callback=None):
+    def __init__(self, pixel_handler=None, wake_word_callback=None, sleep_callback=None, listening_callback=None, responding_callback=None, blink_callback=None):
         if not args.disable_physical:
             self.access_key = os.getenv("PICOVOICE_KEY")
             self.keywords = ["Hey-Howey"]
             self.sample_rate = 16000
             self.porcupine = pvporcupine.create(keywords=self.keywords, access_key=self.access_key)
             self.leopard = create_leopard(access_key=self.access_key)
-            self.rhino_context_file = "system-control.rhn"
+            self.rhino_context_file = "ppn/system-control.rhn"
             self.rhino = pvrhino.create(context_path=self.rhino_context_file, access_key=self.access_key, require_endpoint=False)
             self.audio = pyaudio.PyAudio()
             
@@ -121,6 +119,9 @@ class AudioListener:
         self.prev_state = 0
         self.wake_word_callback = wake_word_callback
         self.sleep_callback = sleep_callback
+        self.listening_callback = listening_callback
+        self.responding_callback = responding_callback
+        self.blink_callback = blink_callback
         self.transcript = None
 
 
@@ -431,7 +432,7 @@ class AudioListener:
         messages = [
              {
                 "role": "system",
-                "content": str('You are Howee, the wacky robot assistant! Howee stands for Human. Operated. Wireless. Electronic. Explorer. You are totally tubular and equipped with mid-2000s pop culture knowledge. Remember to assist with that vibe. Lets get this party started. YOLO! ')
+                "content": str('You are Howee, the robot assistant! Howee stands for Human. Operated. Wireless. Electronic. Explorer. You are totally tubular and equipped with mid-2000s pop culture knowledge. Remember to assist with that vibe. Lets get this party started. YOLO! ')
             }]
         
 
@@ -474,16 +475,25 @@ class AudioListener:
         self.voice(ai_response)
         self.state = self.RESPONDING_TO_INPUT
 
-        conversation = Conversation(content=words, response=ai_response, topics=topics)
-        db.session.add(conversation)
-        db.session.commit()
+        with app.app_context():
+            conversation = Conversation(content=words, response=ai_response, topics=topics)
+            db.session.add(conversation)
+            db.session.commit()
 
         return ai_response
 
     def listen(self):
         if not args.disable_physical:
+            # Backup the current stderr
+            original_stderr = sys.stderr
+
+            # Redirect stderr to /dev/null
+            sys.stderr = open(os.devnull, 'w')
             stream = self.audio.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True,
                                  frames_per_buffer=self.porcupine.frame_length)
+
+            sys.stderr.close()
+            sys.stderr = original_stderr
         print("Listening - Active")
         while True:
             if self.prev_state != self.state:
@@ -510,10 +520,16 @@ class AudioListener:
                     print("Response done playing ...")
                     self.state = self.LISTENING_FOR_INPUT
 
+                if self.responding_callback:
+                    self.responding_callback()
+
             elif self.state == self.LISTENING_FOR_INPUT:
                 print("Listening for user input...")
                 # self.pixel_handler.start_crossfade((0, 0, 0), (0, 25, 0), .5)
         
+                if self.listening_callback:
+                    self.listening_callback()
+
                 stream = self.audio.open(format=pyaudio.paInt16, channels=1, rate=self.sample_rate, input=True,
                                  frames_per_buffer=self.porcupine.frame_length)
                 frames = []
@@ -562,11 +578,17 @@ class AudioListener:
 
                 self.transcript = self.process_audio_data(audio_data)
 
+                if self.responding_callback:
+                    self.responding_callback()
+
             elif self.state == self.SENDING_TO_OPENAI:
                
+
+
                 self.send_to_openai_howee(self.transcript)
 
             elif self.state == self.RESPONDING_TO_INPUT:
+
                 self.pixel_handler.start_crossfade((0, 0, 0), (0, 0, 25), .5)
                 if not pygame.mixer.music.get_busy():
                     print("Response done playing ...")

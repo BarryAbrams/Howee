@@ -11,12 +11,14 @@ class PiServoHatWrapper:
         self.y_axis = ServoController(self, 1, 30, 120)
         self.rt_eyelid = ServoController(self, 2, 120, 0)
         self.lt_eyelid = ServoController(self, 4, 0, 120)
-        self.rb_eyelid = ServoController(self, 3, 25, 180)
-        self.lb_eyelid = ServoController(self, 5, 120, 0)
+        self.rb_eyelid = ServoController(self, 3, 25, 170)
+        self.lb_eyelid = ServoController(self, 5, 140, 0)
 
         self.last_move_time = 0
         self.last_center_x = None
         self.last_center_y = None
+
+        self.blinking_thread = None
 
         self.active = True
             
@@ -24,6 +26,7 @@ class PiServoHatWrapper:
         print("ACTIVATE")
         self.blinking_thread_stop = False  # Reset the flag
         self.active = True
+        self.servo_hat.wake()
         self.start_blinking()
 
     def deactivate(self):
@@ -33,32 +36,46 @@ class PiServoHatWrapper:
         servo_positions = [(self.rt_eyelid, 0), (self.rb_eyelid, 0), (self.lt_eyelid, 0), (self.lb_eyelid, 0)]
         smooth_move_servos(servo_positions, 5)  # Close eyelids
 
+        timer = threading.Timer(5.0, self.servo_hat.sleep)
+        timer.start()
+
     def update_person_position(self, position):
         if self.active:
             if position is not None:
                 x, y = position
-                print("x:", x/255, "y:", y/255)
+                # print("x:", x/255, "y:", y/255)
                 self.move_eyes(x/255, y/255)
 
     def start_blinking(self):
-        self.blinking_thread = threading.Thread(target=self.random_blink)
-        self.blinking_thread.daemon = True  # Set as a daemon thread so it will close when the main program closes
-        self.blinking_thread.start()
+        if not self.blinking_thread:
+            print("start blinking")
+            self.blinking_thread = threading.Thread(target=self.random_blink)
+            self.blinking_thread.daemon = True  # Set as a daemon thread so it will close when the main program closes
+            self.blinking_thread.start()
 
     def stop_blinking(self):
-        if hasattr(self, 'blinking_thread'):
+        if self.blinking_thread:
+            print("stop blinking")
+            self.unblink()
             self.blinking_thread_stop = True  # Signal the thread to stop
-            self.blinking_thread.join()  # Wait for the thread to finish
-
+            self.blinking_thread = None
 
     def random_blink(self):
-        self.blinking_thread_stop = False  # Initialize the flag
-        while not self.blinking_thread_stop:  # Check the flag in the loop condition
-            time.sleep(random.uniform(2, 10))
-            if random.random() < 0.5:
-                self.blink()
-            else:
-                self.natural_blink()
+        self.blinking_thread_stop = False
+        while not self.blinking_thread_stop:
+            total_sleep = random.uniform(2, 10)
+            sleep_elapsed = 0
+
+            while sleep_elapsed < total_sleep and not self.blinking_thread_stop:
+                time.sleep(0.1)  # sleep in small chunks
+                sleep_elapsed += 0.1
+
+            if not self.blinking_thread_stop:
+                print("blink")
+                if random.random() < 0.5:
+                    self.blink()
+                else:
+                    self.natural_blink()
 
     def update_sensor_position(self, sensor_position):
         if not self.active:
@@ -95,6 +112,10 @@ class PiServoHatWrapper:
 
     def move_servo_position(self, channel, angle, duration):
         self.servo_hat.move_servo_position(channel, angle, duration)
+
+    def unblink(self):
+        servo_positions = self.calculate_eyelid_positions(self.y_axis.get_current_position())
+        smooth_move_servos(servo_positions, 5)
 
     def blink(self):
         servo_positions = [(self.rt_eyelid, 0), (self.rb_eyelid, 0), (self.lt_eyelid, 0), (self.lb_eyelid, 0)]
