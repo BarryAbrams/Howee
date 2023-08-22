@@ -4,15 +4,8 @@ import threading, platform
 from servo_hat import PiServoHatWrapper
 from sound import AudioListener
 
-# app = Flask(__name__)
-# socketio = SocketIO(app)
 import time
 
-# @app.route('/')
-# def index():
-#     return render_template('index.html')
-
-print(platform.machine())
 
 if platform.machine() in ['aarch64', 'armv6l']:
     from person_sensor import PersonSensor
@@ -41,9 +34,8 @@ else:
 
 def run_audio_listener():
     global pixel_handler
-    # listener = AudioListener()
     if platform.machine() in ['aarch64', 'armv6l']:
-        listener = AudioListener(pixel_handler=pixel_handler, wake_word_callback=servo_hat.activate, sleep_callback=servo_hat.deactivate)  # Pass the activate method as a callback
+        listener = AudioListener(pixel_handler=pixel_handler, wake_word_callback=servo_hat.activate, sleep_callback=servo_hat.deactivate, listening_callback=servo_hat.stop_blinking, responding_callback=servo_hat.start_blinking, blink_callback=servo_hat.blink)  # Pass the activate method as a callback
     else:
         listener = AudioListener()
     listener.listen()
