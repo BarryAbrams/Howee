@@ -26,6 +26,7 @@ import numpy as np
 load_dotenv()
 
 
+
 parser = argparse.ArgumentParser(description="Choose the mode of interaction.")
 parser.add_argument("--disable_physical", help="Disable the physical interface", action="store_true")
 parser.add_argument("--disable_web", help="Disable the Web interface", action="store_true")
@@ -370,6 +371,7 @@ class AudioListener:
                     return transcript
                 else:
                     self.state = self.LISTENING_FOR_WAKE_WORD
+                    self.play_sfx("Sleep.wav")
                     if self.sleep_callback:
                         self.sleep_callback()
                     return None
@@ -418,6 +420,7 @@ class AudioListener:
 
     def send_to_openai_howee(self, words):
         topics = self.send_to_openai_topics(words)
+        self.play_sfx("Sending.wav")
 
         if not args.disable_physical:
             self.pixel_handler.start_crossfade((0, 0, 0), (25, 0, 25), .5)
@@ -494,7 +497,9 @@ class AudioListener:
 
             sys.stderr.close()
             sys.stderr = original_stderr
+
         print("Listening - Active")
+        self.play_sfx("Boot.wav")
         while True:
             if self.prev_state != self.state:
                 if not args.disable_web:
@@ -510,11 +515,14 @@ class AudioListener:
                     pcm = np.frombuffer(data, dtype=np.int16)
                     result = self.porcupine.process(pcm)
                     if result >= 0:
+                        self.play_sfx("Wake.wav")
                         self.wake_word_detected()
 
             elif self.state == self.RESPONDING_TO_WAKE_WORD:
                 if not args.disable_physical:
                     self.pixel_handler.start_crossfade((0, 0, 0), (0, 0, 25), .5)
+                    
+                self.play_sfx("Responding.wav")
 
                 if not pygame.mixer.music.get_busy():
                     print("Response done playing ...")
@@ -526,7 +534,7 @@ class AudioListener:
             elif self.state == self.LISTENING_FOR_INPUT:
                 print("Listening for user input...")
                 # self.pixel_handler.start_crossfade((0, 0, 0), (0, 25, 0), .5)
-        
+
                 if self.listening_callback:
                     self.listening_callback()
 
@@ -628,6 +636,7 @@ class AudioListener:
         return frames[::channels]
 
     def play_audio(self, output_file):
+        print(os.path.exists(output_file))
         try:
             # Initialize pygame mixer and play the audio file
             pygame.mixer.init(frequency=int(44100 * 1.15))
@@ -639,6 +648,19 @@ class AudioListener:
                 pygame.time.Clock().tick(10)
         except IOError as error:
             print(error)
+
+    def play_sfx(self, file):
+        relative_path = "sfx/" + file
+        output_file = self.get_full_path(relative_path)
+
+        # Start a new thread to play the audio
+        audio_thread = threading.Thread(target=self.play_audio, args=(output_file,))
+        audio_thread.start()
+
+    def get_full_path(self, relative_path):
+        current_directory = os.getcwd()
+        full_path = os.path.join(current_directory, relative_path)
+        return full_path
 
     def voice(self, message):
         voiceResponse = polly.synthesize_speech(Text=message, OutputFormat="mp3", VoiceId="Joey")

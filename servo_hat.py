@@ -171,7 +171,7 @@ class ServoController:
 
     def move_to_center(self):
         self.move_to_position(0.5)
-        time.sleep(.5)
+        time.sleep(.125)
 
     def move_to_angle(self, angle):
         if angle < min(self.min_angle, self.max_angle):

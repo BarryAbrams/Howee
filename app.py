@@ -40,6 +40,19 @@ def run_audio_listener():
         listener = AudioListener()
     listener.listen()
 
+def play_audio(output_file):
+    try:
+        # Initialize pygame mixer and play the audio file
+        pygame.mixer.init(frequency=int(44100 * 1.15))
+        pygame.mixer.music.load(output_file)
+        pygame.mixer.music.play()
+
+        # Wait for the music to finish playing
+        while pygame.mixer.music.get_busy():
+            pygame.time.Clock().tick(10)
+    except IOError as error:
+        print(error)
+
 audio_listener_thread = threading.Thread(target=run_audio_listener)  # Create a separate thread for the audio listener
 audio_listener_thread.start()
 
